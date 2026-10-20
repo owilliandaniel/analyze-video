@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Prepara um vídeo (ex.: gravação do Teams) para leitura pelo Claude, tudo local:
-transcrição com horário (legenda embutida ou faster-whisper), quadros da tela compartilhada,
-grades 3x3 com o horário e partes de N minutos.
+"""Transcreve um vídeo, tudo local: fala com horário (legenda embutida ou faster-whisper) e, para o
+Claude descrever a tela, quadros das trocas de tela, grades 3x3 com o horário e partes de N minutos.
 
     python prepare_video.py VIDEO --out PASTA [--vocab ARQ ...] [--from hh:mm:ss --to hh:mm:ss] ...
+    python prepare_video.py VIDEO --out PASTA --finish   # junta as linhas [tela] e apaga o trabalho
 
-Etapas com cache em PASTA/_work: rodar de novo pula o que já está pronto com os mesmos parâmetros.
+Saída: só PASTA/transcricao.md. O trabalho fica em %TEMP%/analyze-video/<nome da PASTA> (cache:
+rodar de novo pula o que já está pronto) e é apagado pelo --finish.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import shutil
 import site
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -48,11 +50,6 @@ def log(msg: str) -> None:
 def hms(t: float) -> str:
     t = max(0, int(t))
     return f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}"
-
-
-def srt_time(t: float) -> str:
-    ms = int(round(max(0.0, t) * 1000))
-    return f"{ms // 3600000:02d}:{ms % 3600000 // 60000:02d}:{ms % 60000 // 1000:02d},{ms % 1000:03d}"
 
 
 def parse_time(s: str | None) -> float | None:
@@ -219,11 +216,21 @@ def transcribe(args, video: Path, info: dict, start: float, end: float, work: Pa
     return data
 
 
-def write_transcript(data: dict, out: Path, header: list[str]) -> None:
+NOTE_LINE = re.compile(r"^\s*[-*]?\s*\[(\d{1,2}:\d{2}:\d{2})\]\s*(?:\[tela\]\s*)?(.+?)\s*$")
+
+
+def read_notes(ndir: Path) -> list[tuple[float, str]]:
+    notes = []
+    for f in sorted(ndir.glob("*.md")) if ndir.exists() else []:
+        for ln in f.read_text(encoding="utf-8").splitlines():
+            m = NOTE_LINE.match(ln)
+            if m:
+                notes.append((parse_time(m.group(1)), m.group(2)))
+    return notes
+
+
+def write_transcript(data: dict, out: Path, header: list[str], notes: list[tuple[float, str]] = ()) -> None:
     segs = data["segments"]
-    with open(out / "transcricao.srt", "w", encoding="utf-8") as f:
-        for i, s in enumerate(segs, 1):
-            f.write(f"{i}\n{srt_time(s['start'])} --> {srt_time(s['end'])}\n{s['text']}\n\n")
     paras: list[tuple[float, list[str]]] = []
     last_end, para_start = -1e9, 0.0
     for s in segs:  # parágrafo novo em pausa > 1,5 s ou a cada ~45 s
@@ -232,8 +239,11 @@ def write_transcript(data: dict, out: Path, header: list[str]) -> None:
             para_start = s["start"]
         paras[-1][1].append(s["text"])
         last_end = s["end"]
-    head = header + [f"Fonte: {data['meta']['source']}. Transcrição automática: termos técnicos podem sair errados."]
-    body = [f"[{hms(t)}] {' '.join(txt)}" for t, txt in paras] or ["(sem fala)"]
+    head = header + [f"Fonte: {data['meta']['source']}. Transcrição automática: termos técnicos podem sair errados."
+                     + (" Linhas [tela] = o que aparece na tela." if notes else "")]
+    # nota de tela antes da fala do mesmo segundo
+    items = [(t, 1, f"[{hms(t)}] {' '.join(txt)}") for t, txt in paras] + [(t, 0, f"[{hms(t)}] [tela] {n}") for t, n in notes]
+    body = [line for _, _, line in sorted(items, key=lambda x: (x[0], x[1]))] or ["(sem fala)"]
     (out / "transcricao.md").write_text("\n\n".join(head + body) + "\n", encoding="utf-8")
 
 
@@ -397,9 +407,11 @@ def write_parts(bounds, segs, frames, sheets, work: Path) -> list[Path]:
 def main() -> None:
     global LOG_PATH, FFMPEG, FFPROBE
     sys.stdout.reconfigure(encoding="utf-8")
-    ap = argparse.ArgumentParser(description="Prepara um vídeo para análise: transcrição, quadros, grades e partes.")
+    ap = argparse.ArgumentParser(description="Transcreve um vídeo: fala com horário e material para descrever a tela.")
     ap.add_argument("video")
-    ap.add_argument("--out", required=True, help="pasta de saída (ex.: Downloads/<nome>_analise)")
+    ap.add_argument("--out", required=True, help="pasta de saída; no fim só tem o transcricao.md")
+    ap.add_argument("--work", help="pasta de trabalho (padrão: %%TEMP%%/analyze-video/<nome da pasta de saída>)")
+    ap.add_argument("--finish", action="store_true", help="junta as notas de <trabalho>/telas e apaga o trabalho")
     ap.add_argument("--vocab", action="append", default=[], help="arquivo de termos (.txt, ou .md com '## Vocabulário')")
     ap.add_argument("--lang", default="pt")
     ap.add_argument("--model", default="large-v3-turbo")
@@ -417,7 +429,11 @@ def main() -> None:
     if not video.is_file():
         sys.exit(f"vídeo não encontrado: {video}")
     out = Path(args.out).expanduser().resolve()
-    work = out / "_work"
+    work = Path(args.work).expanduser().resolve() if args.work else Path(tempfile.gettempdir()) / "analyze-video" / out.name
+    if args.finish:
+        finish(out, work)
+        return
+    out.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
     LOG_PATH = work / "prepare.log"
     FFMPEG, FFPROBE = find_tool("ffmpeg"), find_tool("ffprobe")
@@ -439,12 +455,18 @@ def main() -> None:
     header = [f"# Transcrição: {video.name}",
               f"Duração {hms(duration)}" + (f", janela {hms(start)} a {hms(end)}" if (start, end) != (0.0, duration) else "")
               + (f", gravado em {created[:10]}" if created else "") + ". Horários = posição no vídeo."]
-    write_transcript(trans, out, header)
+    write_transcript(trans, out, header)  # só a fala; o --finish acrescenta as linhas [tela]
+    save_json(work / "run.json", {"header": header})
 
-    fr = frames_stage(args, video, start, end, work)
+    if vstream:
+        fr = frames_stage(args, video, start, end, work)
+    else:
+        log("sem faixa de vídeo: só a fala")
+        fr = {"frames": [], "scanned": 0, "seconds": 0}
     bounds = chunk_bounds(start, end, args.chunk_min)
     sheets = make_sheets(fr["frames"], bounds, work / "grades")
     parts = write_parts(bounds, trans["segments"], fr["frames"], sheets, work)
+    (work / "telas").mkdir(exist_ok=True)
 
     manifest = [
         f"# Manifesto: {video.name}", "",
@@ -457,11 +479,26 @@ def main() -> None:
         f"--scene {args.scene}, --floor-s {args.floor_s}",
         f"- Grades: {sum(len(s) for s in sheets)}; partes: {len(parts)} de {args.chunk_min:g} min",
         f"- Vocabulário no prompt: {prompt or '(nenhum)'}",
-        f"- Tempo total desta execução: {round(time.time() - t_all)} s", "",
+        f"- Tempo total desta execução: {round(time.time() - t_all)} s",
+        f"- Notas de tela: `{work / 'telas'}\\NN.md`, linhas `[hh:mm:ss] texto`; depois rodar com `--finish`", "",
         "## Partes", ""]
     manifest += [f"{i}. `{p}` ({len(s)} grades)" for i, (p, s) in enumerate(zip(parts, sheets), 1)]
     (work / "MANIFEST.md").write_text("\n".join(manifest) + "\n", encoding="utf-8")
     log(f"pronto: {work / 'MANIFEST.md'}")
+
+
+def finish(out: Path, work: Path) -> None:
+    trans_path, run_path = work / "transcript.json", work / "run.json"
+    if not (trans_path.exists() and run_path.exists()):
+        sys.exit(f"trabalho não encontrado em {work} (rodar antes sem --finish)")
+    trans = json.loads(trans_path.read_text(encoding="utf-8"))
+    header = json.loads(run_path.read_text(encoding="utf-8"))["header"]
+    notes = read_notes(work / "telas")
+    out.mkdir(parents=True, exist_ok=True)
+    write_transcript(trans, out, header, notes)
+    shutil.rmtree(work)
+    log(f"pronto: {out / 'transcricao.md'} ({len(trans['segments'])} trechos de fala, {len(notes)} linhas de tela); "
+        f"trabalho apagado")
 
 
 if __name__ == "__main__":
