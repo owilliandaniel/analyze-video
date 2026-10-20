@@ -1,0 +1,3 @@
+# Termos genéricos para o prompt do Whisper (um por linha ou separados por vírgula).
+# Termos do projeto vão no <projeto>\.claude\video-context.md, seção "## Vocabulário".
+Teams, compartilhar tela, reunião, apresentação, planilha, Excel, PDF
